@@ -93,7 +93,10 @@
                 grab: { grabbable: false },
                 collisionless: true,
                 lifetime: 500,
-                userData: JSON.stringify({textureURL: userData.textureURL})
+                userData: JSON.stringify({
+                    textureURL: userData.textureURL,
+                    colorPaletteID: _this.entityID
+                })
             }, 'avatar');
             var colorRescaled = {};
             colorRescaled.red = _this.rgbConversion(properties.color.red);
@@ -105,6 +108,7 @@
                 materialURL: "materialData",
                 priority: 1,
                 parentID: paintSphere,
+                collisionless: true,
                 materialData: JSON.stringify({
                     materials: {
                         albedo: colorRescaled,

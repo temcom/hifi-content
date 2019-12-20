@@ -10,8 +10,9 @@
 
 var http = require('http');
 var url = require('url');
-var dbInfo = require('./dbInfo.json');
-var DEBUG = false;
+var config = require('./config.json');
+var request = require('request');
+var DEBUG = 0;
 
 // Returns the user's current status from the DB
 function getStatus(queryParamObject, response) {
@@ -111,11 +112,14 @@ function startHeartbeatTimer(username, response) {
 
 // Update employee status in database
 function updateEmployee(updates, response) {
+    if (DEBUG) {
+        console.log("UPDATES: ", updates);
+    }
     // Create strings for query from the updates object
-    var columnString = ""; // (username, displayName, status)
-    var valueString = ""; // ('username1', 'Display Name', 'busy')
-    var updateString = ""; // username='username1', displayName='Display Name', status='busy'
-    var validUpdateParams = ["username", "displayName", "status", "teamName", "location"];
+    var columnString = ""; // (username, displayName, status, organization)
+    var valueString = ""; // ('username1', 'Display Name', 'busy', 'HiFi')
+    var updateString = ""; // username='username1', displayName='Display Name', status='busy', organization='HiFi'
+    var validUpdateParams = ["username", "displayName", "status", "location", "organization"];
     for (var key in updates) {
         if (validUpdateParams.indexOf(key) === -1) {
             continue;
@@ -192,12 +196,23 @@ function formatMemberData(singleResultObject) {
     };
 }
 
-
 // Get all employees
-// Return tables organized by Team names with all employee information
-function getAllEmployees(response) {
-    var query = `SELECT * FROM statusIndicator
-        ORDER BY teamName, displayName`;
+// Return tables with all employee information
+function getAllEmployees(organization, response) {
+    if (!organization) {
+        var responseObject = {
+            status: "error",
+            text: "You must specify an organization!"
+        };
+
+        response.statusCode = 400;
+        response.setHeader('Content-Type', 'application/json');
+        return response.end(JSON.stringify(responseObject));
+    }
+
+    var query = `SELECT * FROM statusIndicator 
+        WHERE organization = '${organization}' 
+        ORDER BY displayName`;
 
     connection.query(query, function (error, results, fields) {
         if (error) {
@@ -213,29 +228,12 @@ function getAllEmployees(response) {
 
         var responseObject = {
             "status": "success",
-            "teams": []
+            "people": []
         };
 
-        var currentTeamObject = {};
-        var currentTeamName = false;
         for (var i = 0; i < results.length; i++) {
-            if (currentTeamName !== results[i].teamName) {
-                currentTeamName = results[i].teamName;
-
-                if (i > 0) {
-                    responseObject.teams.push(currentTeamObject);
-                }
-
-                currentTeamObject = {
-                    "name": currentTeamName,
-                    "members": []
-                };
-            }
-
-            currentTeamObject.members.push(formatMemberData(results[i]));
+            responseObject.people.push(formatMemberData(results[i]));
         }
-        // Push the last one.
-        responseObject.teams.push(currentTeamObject);
 
         response.statusCode = 200;
         response.setHeader('Content-Type', 'application/json');
@@ -244,42 +242,47 @@ function getAllEmployees(response) {
 }
 
 
-// Get employees from team
-function getTeamEmployees(teamName, response) {
-    var query = `SELECT * FROM statusIndicator
-        WHERE teamName='${teamName}' ORDER BY displayName`;
+function handleCanaryRequest(res) {
+    // Checks that NGINX is serving the right page.
+    var allEmployeesPageOK;
+    var apiRouterOK = true; // Always true if we can get here!
+    var sqlConnectionOK;
+    request.get(
+        config.wwwRoot + "allEmployees.html",
+        {
+            timeout: 15000
+        },
+        (error, response) => {
+            allEmployeesPageOK = !error;
 
-    connection.query(query, function (error, results, fields) {
-        if (error) {
-            var responseObject = {
-                status: "error",
-                text: "Error while retrieving employees with teamName! " + JSON.stringify(error)
-            };
+            var query = "SELECT 1;"
+            connection.query(query, function (error, results, fields) {
+                sqlConnectionOK = !error;
 
-            response.statusCode = 500;
-            response.setHeader('Content-Type', 'application/json');
-            return response.end(JSON.stringify(responseObject));
-        }        
-
-        var responseObject = {
-            "status": "success",
-            "teams": []
-        };
-        var currentTeamObject = {
-            "name": teamName,
-            "members": []
-        };
-        
-        for (var i = 0; i < results.length; i++) {
-            currentTeamObject.members.push(formatMemberData(results[i]));
+                // The `result` value should be a logical AND
+                // of all of the subsystems whose status we check.
+                var responseObject = {
+                    result: apiRouterOK && allEmployeesPageOK && sqlConnectionOK,
+                    systemStatus: {
+                        apiRouter: {
+                            status: apiRouterOK
+                        },
+                        http: {
+                            allEmployeesPage: {
+                                status: allEmployeesPageOK
+                            }
+                        },
+                        database: {
+                            status: sqlConnectionOK
+                        }
+                    }
+                };
+                res.statusCode = 200;
+                res.setHeader('Content-Type', 'application/json');
+                return res.end(JSON.stringify(responseObject));
+            });
         }
-
-        responseObject.teams.push(currentTeamObject);
-
-        response.statusCode = 200;
-        response.setHeader('Content-Type', 'application/json');
-        return response.end(JSON.stringify(responseObject));
-    });
+    );
 }
 
 
@@ -288,7 +291,7 @@ function getTeamEmployees(teamName, response) {
 // "getStatus"
 // "heartbeat"
 // "getAllEmployees"
-// "getTeamEmployees"
+// "canary"
 function handleGetRequest(request, response) {
     var queryParamObject = url.parse(request.url, true).query;
     var type = queryParamObject.type;
@@ -308,15 +311,12 @@ function handleGetRequest(request, response) {
             updateEmployee(queryParamObject, response);
         break;
 
-        case "getAllEmployees": // http://localhost:3305/?type=getAllEmployees
-            getAllEmployees(response);
+        case "getAllEmployees": // http://localhost:3305/?type=getAllEmployees&organization=org
+            getAllEmployees(queryParamObject.organization, response);
             break;
 
-        case "getTeamEmployees": // http://localhost:3305/?type=getTeamEmployees&teamName=team1
-            // {
-            //      teamName: "exampleTeamName"
-            // }
-            getTeamEmployees(queryParamObject.teamName, response);
+        case "canary":
+            handleCanaryRequest(response);
             break;
 
         default:
@@ -352,10 +352,10 @@ var mysql = require('mysql');
 var connection;
 function connectToStatusDB() {
     connection = mysql.createConnection({
-        host: dbInfo.mySQLHost,
-        user: dbInfo.mySQLUsername,
-        password: dbInfo.mySQLPassword,
-        database: dbInfo.databaseName
+        host: config.mySQLHost,
+        user: config.mySQLUsername,
+        password: config.mySQLPassword,
+        database: config.databaseName
     });
     connection.connect(function (error) {
         if (error) {
@@ -372,8 +372,8 @@ function maybeCreateNewTables(response) {
         username VARCHAR(100) PRIMARY KEY,
         displayName VARCHAR(100),
         status VARCHAR(150) DEFAULT 'busy',
-        teamName VARCHAR(100) DEFAULT 'TBD',
-        location VARCHAR(100) DEFAULT 'unknown'
+        location VARCHAR(100) DEFAULT 'unknown',
+        organization VARCHAR(200) DEFAULT NULL
     )`;
     connection.query(query, function (error, results, fields) {
         if (error) {
@@ -387,12 +387,12 @@ function maybeCreateNewTables(response) {
 // Creates the database and tables
 function maybeCreateStatusDB() {
     connection = mysql.createConnection({
-        host: dbInfo.mySQLHost,
-        user: dbInfo.mySQLUsername,
-        password: dbInfo.mySQLPassword
+        host: config.mySQLHost,
+        user: config.mySQLUsername,
+        password: config.mySQLPassword
     });
 
-    var query = `CREATE DATABASE IF NOT EXISTS ${dbInfo.databaseName} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`;
+    var query = `CREATE DATABASE IF NOT EXISTS ${config.databaseName} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`;
     connection.query(query, function (error, results, fields) {
         if (error) {
             console.log("error with connection");
@@ -402,10 +402,10 @@ function maybeCreateStatusDB() {
         connection.end();
 
         connection = mysql.createConnection({
-            host: dbInfo.mySQLHost,
-            user: dbInfo.mySQLUsername,
-            password: dbInfo.mySQLPassword,
-            database: dbInfo.databaseName
+            host: config.mySQLHost,
+            user: config.mySQLUsername,
+            password: config.mySQLPassword,
+            database: config.databaseName
         });
 
         maybeCreateNewTables();
